@@ -108,6 +108,12 @@ type State struct {
 	scrollbackMax int
 }
 
+type logicalLine struct {
+	glyphs       []Glyph
+	hasCursor    bool
+	cursorOffset int
+}
+
 func newState(w io.Writer) *State {
 	return &State{
 		w:             w,
@@ -327,10 +333,46 @@ func (t *State) resize(cols, rows int) bool {
 	if cols < 1 || rows < 1 {
 		return false
 	}
+	oldCols, oldRows := t.cols, t.rows
+	if oldCols > 0 && oldRows > 0 && cols != oldCols {
+		t.lines, t.cur = t.reflowLines(t.lines, oldCols, cols, rows, t.cur, true)
+		t.altLines, t.curSaved = t.reflowLines(t.altLines, oldCols, cols, rows, t.curSaved, false)
+		t.cols = cols
+		t.rows = rows
+		t.dirty = make([]bool, rows)
+		t.tabs = make([]bool, cols)
+		t.changed |= ChangedScreen
+		for i := 0; i < rows; i++ {
+			t.dirty[i] = true
+		}
+		t.setScroll(0, rows-1)
+		t.moveTo(t.cur.X, t.cur.Y)
+		return false
+	}
 	slide := t.cur.Y - rows + 1
 	if slide > 0 {
+		// Save lines being slid off the top into scrollback so they can be
+		// restored if the terminal grows back (e.g. AI panel closes).
+		for i := 0; i < slide && i < len(t.lines); i++ {
+			saved := make(line, t.cols)
+			copy(saved, t.lines[i])
+			t.scrollback = append(t.scrollback, saved)
+		}
+		if len(t.scrollback) > t.scrollbackMax {
+			t.scrollback = t.scrollback[len(t.scrollback)-t.scrollbackMax:]
+		}
 		copy(t.lines, t.lines[slide:slide+rows])
 		copy(t.altLines, t.altLines[slide:slide+rows])
+	}
+
+	// When height increases, pull lines from scrollback to fill the new rows above.
+	extra := rows - t.rows
+	var sbPull int
+	if extra > 0 && len(t.scrollback) > 0 {
+		sbPull = extra
+		if sbPull > len(t.scrollback) {
+			sbPull = len(t.scrollback)
+		}
 	}
 
 	lines, altLines, tabs := t.lines, t.altLines, t.tabs
@@ -347,10 +389,19 @@ func (t *State) resize(cols, rows int) bool {
 		t.lines[i] = make(line, cols)
 		t.altLines[i] = make(line, cols)
 	}
-	for i := 0; i < minrows; i++ {
-		copy(t.lines[i], lines[i])
-		copy(t.altLines[i], altLines[i])
+	// Place scrollback lines at the top, then existing content below.
+	sbStart := len(t.scrollback) - sbPull
+	for i := 0; i < sbPull; i++ {
+		src := t.scrollback[sbStart+i]
+		dst := t.lines[i]
+		copy(dst, src)
 	}
+	t.scrollback = t.scrollback[:sbStart]
+	for i := 0; i < minrows; i++ {
+		copy(t.lines[sbPull+i], lines[i])
+		copy(t.altLines[sbPull+i], altLines[i])
+	}
+	t.cur.Y += sbPull
 	copy(t.tabs, tabs)
 	if cols > t.cols {
 		i := t.cols - 1
@@ -376,6 +427,134 @@ func (t *State) resize(cols, rows int) bool {
 		t.swapScreen()
 	}
 	return slide > 0
+}
+
+func (t *State) reflowLines(src []line, oldCols, newCols, rows int, cur Cursor, allowScrollback bool) ([]line, Cursor) {
+	logical := make([]logicalLine, 0, len(src))
+	current := logicalLine{}
+	for y, row := range src {
+		seg, keep := trimLineForReflow(row, oldCols, cur, y)
+		if current.glyphs == nil {
+			current.glyphs = make([]Glyph, 0, keep)
+		}
+		if y == cur.Y {
+			current.hasCursor = true
+			current.cursorOffset = len(current.glyphs) + min(cur.X, keep)
+		}
+		current.glyphs = append(current.glyphs, seg...)
+		if !rowContinues(row, oldCols) {
+			logical = append(logical, current)
+			current = logicalLine{}
+		}
+	}
+	if current.glyphs != nil || len(logical) == 0 {
+		logical = append(logical, current)
+	}
+
+	reflowed := make([]line, 0, len(src))
+	newCur := cur
+	cursorRow, cursorCol := 0, 0
+	cursorSet := false
+
+	for _, ll := range logical {
+		if len(ll.glyphs) == 0 {
+			reflowed = append(reflowed, blankLine(newCols))
+			if ll.hasCursor && !cursorSet {
+				cursorRow, cursorCol = len(reflowed)-1, 0
+				cursorSet = true
+			}
+			continue
+		}
+
+		offset := 0
+		for {
+			end := min(offset+newCols, len(ll.glyphs))
+			dst := blankLine(newCols)
+			copy(dst, ll.glyphs[offset:end])
+			if end < len(ll.glyphs) && newCols > 0 {
+				dst[newCols-1].Mode |= attrWrap
+			}
+			reflowed = append(reflowed, dst)
+			if ll.hasCursor && !cursorSet && ll.cursorOffset >= offset && ll.cursorOffset <= end {
+				cursorRow = len(reflowed) - 1
+				cursorCol = ll.cursorOffset - offset
+				if cursorCol >= newCols {
+					cursorCol = newCols - 1
+				}
+				if cursorCol < 0 {
+					cursorCol = 0
+				}
+				cursorSet = true
+			}
+			if end >= len(ll.glyphs) {
+				break
+			}
+			offset = end
+		}
+	}
+
+	start := 0
+	if len(reflowed) > rows {
+		start = max(0, cursorRow-rows+1)
+		end := min(start+rows, len(reflowed))
+		if allowScrollback && start > 0 {
+			for i := 0; i < start; i++ {
+				saved := make(line, newCols)
+				copy(saved, reflowed[i])
+				t.scrollback = append(t.scrollback, saved)
+			}
+			if len(t.scrollback) > t.scrollbackMax {
+				t.scrollback = t.scrollback[len(t.scrollback)-t.scrollbackMax:]
+			}
+		}
+		reflowed = reflowed[start:end]
+		cursorRow -= start
+	}
+	for len(reflowed) < rows {
+		reflowed = append(reflowed, blankLine(newCols))
+	}
+
+	newCur.X = clamp(cursorCol, 0, newCols-1)
+	newCur.Y = clamp(cursorRow, 0, rows-1)
+	return reflowed, newCur
+}
+
+func trimLineForReflow(row line, oldCols int, cur Cursor, y int) ([]Glyph, int) {
+	keep := min(len(row), oldCols)
+	preserve := 0
+	if y == cur.Y {
+		preserve = cur.X + 1
+	}
+	for keep > preserve && keep > 0 {
+		g := row[keep-1]
+		if g.Char != 0 && g.Char != ' ' {
+			break
+		}
+		if g.Mode != 0 || g.FG < DefaultFG || g.BG < DefaultBG {
+			break
+		}
+		keep--
+	}
+	seg := make([]Glyph, keep)
+	copy(seg, row[:keep])
+	return seg, keep
+}
+
+func rowContinues(row line, oldCols int) bool {
+	if oldCols == 0 || len(row) < oldCols {
+		return false
+	}
+	return row[oldCols-1].Mode&attrWrap != 0
+}
+
+func blankLine(cols int) line {
+	l := make(line, cols)
+	for i := range l {
+		l[i].Char = ' '
+		l[i].FG = DefaultFG
+		l[i].BG = DefaultBG
+	}
+	return l
 }
 
 func (t *State) clear(x0, y0, x1, y1 int) {

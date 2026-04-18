@@ -32,6 +32,10 @@ type View interface {
 	// Resize changes the size of the virtual terminal.
 	Resize(cols, rows int)
 
+	// SetViewportRows changes the visible row count used for cursor movement
+	// and scrolling, while keeping the backing storage height unchanged.
+	SetViewportRows(rows int)
+
 	// Mode returns the current terminal mode.//
 	Mode() ModeFlag
 

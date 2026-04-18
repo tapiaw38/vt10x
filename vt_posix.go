@@ -1,3 +1,4 @@
+//go:build linux || darwin || dragonfly || solaris || openbsd || netbsd || freebsd
 // +build linux darwin dragonfly solaris openbsd netbsd freebsd
 
 package vt10x
@@ -105,4 +106,13 @@ func (t *terminal) Resize(cols, rows int) {
 	t.lock()
 	defer t.unlock()
 	_ = t.resize(cols, rows)
+	if t.viewportRows == 0 || t.viewportRows > rows {
+		t.viewportRows = rows
+	}
+	t.setScroll(0, t.viewportRows-1)
+	t.moveTo(t.cur.X, t.cur.Y)
+}
+
+func (t *terminal) SetViewportRows(rows int) {
+	t.State.SetViewportRows(rows)
 }

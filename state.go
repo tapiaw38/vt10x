@@ -87,6 +87,7 @@ type State struct {
 	mu            sync.Mutex
 	changed       ChangeFlag
 	cols, rows    int
+	viewportRows  int
 	lines         []line
 	altLines      []line
 	dirty         []bool // line dirtiness
@@ -591,12 +592,16 @@ func (t *State) moveAbsTo(x, y int) {
 
 func (t *State) moveTo(x, y int) {
 	var miny, maxy int
+	visibleRows := t.viewportRows
+	if visibleRows < 1 || visibleRows > t.rows {
+		visibleRows = t.rows
+	}
 	if t.cur.State&cursorOrigin != 0 {
 		miny = t.top
 		maxy = t.bottom
 	} else {
 		miny = 0
-		maxy = t.rows - 1
+		maxy = visibleRows - 1
 	}
 	x = clamp(x, 0, t.cols-1)
 	y = clamp(y, miny, maxy)
@@ -620,13 +625,34 @@ func (t *State) dirtyAll() {
 }
 
 func (t *State) setScroll(top, bottom int) {
-	top = clamp(top, 0, t.rows-1)
-	bottom = clamp(bottom, 0, t.rows-1)
+	visibleRows := t.viewportRows
+	if visibleRows < 1 || visibleRows > t.rows {
+		visibleRows = t.rows
+	}
+	top = clamp(top, 0, visibleRows-1)
+	bottom = clamp(bottom, 0, visibleRows-1)
 	if top > bottom {
 		top, bottom = bottom, top
 	}
 	t.top = top
 	t.bottom = bottom
+}
+
+func (t *State) SetViewportRows(rows int) {
+	t.lock()
+	defer t.unlock()
+
+	if t.rows < 1 {
+		t.viewportRows = rows
+		return
+	}
+	rows = clamp(rows, 1, t.rows)
+	if rows == t.viewportRows {
+		return
+	}
+	t.viewportRows = rows
+	t.setScroll(0, rows-1)
+	t.moveTo(t.cur.X, t.cur.Y)
 }
 
 func min(a, b int) int {

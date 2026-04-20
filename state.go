@@ -128,6 +128,11 @@ func (t *State) ScrollbackLen() int {
 	return len(t.scrollback)
 }
 
+// ClearScrollback discards all lines in the scrollback buffer.
+func (t *State) ClearScrollback() {
+	t.scrollback = t.scrollback[:0]
+}
+
 // ScrollbackLine returns the glyphs for scrollback line i (0 = oldest).
 func (t *State) ScrollbackLine(i int) []Glyph {
 	if i < 0 || i >= len(t.scrollback) {
